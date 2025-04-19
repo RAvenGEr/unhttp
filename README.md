@@ -12,7 +12,7 @@ Based on httparse, http and tokio, this aims to be a HTTP client and
 
 > Another HTTP library, really?
 
-Yes, I needed something to work where I was using Hyper and my HTTP server
-wasn't exactly supported.
+Yes, I needed something to work where I was using Hyper and the HTTP server mutipart streaming mode
+wasn't easily supported.
 
 Unhttp is my attempt to write an easy to hack on HTTP library.
