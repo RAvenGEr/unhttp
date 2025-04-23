@@ -41,6 +41,9 @@ pub enum Error {
     HeaderStr(#[from] http::header::ToStrError),
     #[error("Failed parsing integer")]
     ParseInt(#[from] std::num::ParseIntError),
+    #[cfg(feature = "rustls")]
+    #[error("Invalid DNS name")]
+    InvalidDNSName(#[from] rustls::pki_types::InvalidDnsNameError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

@@ -14,7 +14,6 @@ pub struct Client {
     credentials: Option<(String, String)>,
     max_redirects: u32,
     keep_alive: bool,
-    must_close: bool,
     content_length: Option<usize>,
 }
 
@@ -26,7 +25,6 @@ impl Client {
             credentials: None,
             max_redirects: 1,
             keep_alive: true,
-            must_close: false,
             content_length: None,
         }
     }
@@ -53,13 +51,11 @@ impl Client {
         &mut self,
         req: &Request<B>,
     ) -> Result<ResponseHeaders> {
-        let mut write = self.conn.write()?;
-        request::write_request(&mut write, req).await?;
+        request::write_request(&mut self.conn, req).await?;
         // Read Response
         let mut ctx: response::ResponseCtx<64> = response::ResponseCtx::new();
-        let mut read = self.conn.read()?;
         loop {
-            self.rx_buf.read_from(&mut read).await?;
+            self.read().await?;
             let buf = self.rx_buf.as_ref();
             if let Some(res) = ctx.parse(buf)? {
                 // Remove header data from read buffer
@@ -73,7 +69,7 @@ impl Client {
     /// Perform a GET request
     pub async fn get(&mut self, url: http::Uri) -> Result<ResponseHeaders> {
         let host = url.host().ok_or(Error::NoHost)?;
-        let port = url.port_u16().unwrap_or(80);
+        let port = port_from(&url);
         let path = path_query(&url);
 
         if let Some((username, password)) = credentials_from_url(&url) {
@@ -86,8 +82,13 @@ impl Client {
             .header(header::CONNECTION, "keep-alive")
             .header(header::HOST, host)
             .body(Empty::<Bytes>::new())?;
-
+        #[cfg(feature = "rustls")]
+        let tls = url.scheme_str() == Some("https");
+        #[cfg(feature = "rustls")]
+        self.conn.connect_to(host, port, tls).await?;
+        #[cfg(not(feature = "rustls"))]
         self.conn.connect_to(host, port).await?;
+
         let mut resp = self.send_request(&req).await?;
 
         // Attempt Digest Authentication if we have credentials and the server requires it
@@ -106,6 +107,9 @@ impl Client {
                 let val = HeaderValue::from_bytes(authorization.as_bytes())?;
                 // Repeat the original request with the AUTHORIZATION header
                 req.headers_mut().insert(header::AUTHORIZATION, val);
+                #[cfg(feature = "rustls")]
+                self.conn.connect_to(host, port, tls).await?;
+                #[cfg(not(feature = "rustls"))]
                 self.conn.connect_to(host, port).await?;
                 resp = self.send_request(&req).await?;
             }
@@ -121,7 +125,7 @@ impl Client {
             Some(l) => {
                 self.read_while(|s| s.rx_buf.len() < l).await?;
                 self.content_length = None;
-                if self.must_close {
+                if self.conn.must_close {
                     self.conn.disconnect();
                 }
                 Ok(Some(self.rx_buf.split_to(l)))
@@ -163,16 +167,14 @@ impl Client {
 
     async fn read_while<F: FnMut(&Self) -> bool>(&mut self, mut check: F) -> Result<()> {
         while check(self) {
-            self.do_read().await?;
+            self.read().await?;
         }
         Ok(())
     }
 
     #[inline]
-    async fn do_read(&mut self) -> Result<()> {
-        let mut read = self.conn.read()?;
-        self.rx_buf.read_from(&mut read).await?;
-        Ok(())
+    async fn read(&mut self) -> Result<()> {
+        self.rx_buf.read_from(&mut self.conn).await
     }
 
     async fn handle_headers(&mut self, response: &ResponseHeaders) -> Result<()> {
@@ -186,10 +188,10 @@ impl Client {
         };
 
         if !self.keep_alive || !response.keep_alive() {
-            self.must_close = true;
+            self.conn.must_close = true;
         }
 
-        if self.must_close && self.content_length.is_some_and(|l| l == 0) {
+        if self.conn.must_close && self.content_length.is_some_and(|l| l == 0) {
             self.conn.disconnect();
         }
 
@@ -209,6 +211,24 @@ impl Default for Client {
     fn default() -> Self {
         Self::new()
     }
+}
+
+#[cfg(not(feature = "rustls"))]
+#[inline]
+fn port_from(url: &Uri) -> u16 {
+    url.port_u16().unwrap_or(80)
+}
+
+#[cfg(feature = "rustls")]
+#[inline]
+fn port_from(url: &Uri) -> u16 {
+    url.port_u16().unwrap_or_else(|| {
+        if url.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        }
+    })
 }
 
 pub struct ClientConversionError {
@@ -314,7 +334,7 @@ impl MultipartReplaceClient {
                     return Ok(self.inner.rx_buf.split_to(bound));
                 }
             }
-            self.inner.do_read().await?;
+            self.inner.read().await?;
         }
     }
 }
