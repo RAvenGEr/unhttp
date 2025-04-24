@@ -1,5 +1,6 @@
 use bytes::{Buf, Bytes, BytesMut};
-use http::{HeaderValue, Request, header};
+use http::{HeaderMap, HeaderValue, Request, StatusCode, Version, header};
+use http_body::Body;
 use http_body_util::Empty;
 use log::{debug, info, warn};
 use memchr::{memchr, memmem};
@@ -11,10 +12,10 @@ use super::*;
 pub struct Client {
     conn: io::Connection,
     rx_buf: io::ReadBuffer,
-    credentials: Option<(String, String)>,
+    credentials: Option<Credentials>,
     max_redirects: u32,
     keep_alive: bool,
-    content_length: Option<usize>,
+    allow_basic_auth: bool,
 }
 
 impl Client {
@@ -25,7 +26,7 @@ impl Client {
             credentials: None,
             max_redirects: 1,
             keep_alive: true,
-            content_length: None,
+            allow_basic_auth: false,
         }
     }
 
@@ -36,7 +37,7 @@ impl Client {
         username: S,
         password: T,
     ) -> &mut Self {
-        self.credentials = Some((username.into(), password.into()));
+        self.credentials = Some(Credentials::new(username.into(), password.into()));
         self
     }
 
@@ -46,91 +47,63 @@ impl Client {
         self
     }
 
+    pub fn keep_alive(&mut self, keep_alive: bool) -> &mut Self {
+        self.keep_alive = keep_alive;
+        self
+    }
+
+    pub fn allow_basic_auth(&mut self, allow_basic: bool) -> &mut Self {
+        self.allow_basic_auth = allow_basic;
+        self
+    }
+
     /// Send a request to the remote and read any response
-    pub async fn send_request<B: http_body::Body>(
-        &mut self,
-        req: &Request<B>,
-    ) -> Result<ResponseHeaders> {
-        request::write_request(&mut self.conn, req).await?;
+    pub async fn send_request<B: http_body::Body>(mut self, req: Request<B>) -> Result<Response> {
+        request::write_request(&mut self.conn, &req).await?;
         // Read Response
         let mut ctx: response::ResponseCtx<64> = response::ResponseCtx::new();
-        loop {
+        let resp = loop {
             self.read().await?;
             let buf = self.rx_buf.as_ref();
             if let Some(res) = ctx.parse(buf)? {
                 // Remove header data from read buffer
                 self.rx_buf.advance(ctx.size());
-                self.handle_headers(&res).await?;
-                break Ok(res);
+                break Response::from_response_headers(res, self);
             }
+        };
+        // Attempt authentication if we have credentials and the server requires it
+        if resp.must_authenticate() && resp.can_authenticate() {
+            Box::pin(resp.authenticate_request(req)).await
+        } else {
+            // TODO: Handle redirect
+            Ok(resp)
         }
     }
 
     /// Perform a GET request
-    pub async fn get(&mut self, url: http::Uri) -> Result<ResponseHeaders> {
+    pub async fn get(mut self, url: http::Uri) -> Result<Response> {
+        let (url, creds) = strip_credentials(url);
+
         let host = url.host().ok_or(Error::NoHost)?;
         let port = port_from(&url);
-        let path = path_query(&url);
 
-        if let Some((username, password)) = credentials_from_url(&url) {
-            self.credentials(username, password);
+        // Don't clear any credentials previously set, only change if url has credentials
+        if creds.is_some() {
+            self.credentials = creds;
         }
 
-        let mut req = Request::builder()
-            .uri(path)
+        let req = Request::builder()
+            .uri(&url)
             .header(header::USER_AGENT, "Unhttp")
             .header(header::CONNECTION, "keep-alive")
             .header(header::HOST, host)
             .body(Empty::<Bytes>::new())?;
         #[cfg(feature = "rustls")]
-        let tls = url.scheme_str() == Some("https");
-        #[cfg(feature = "rustls")]
-        self.conn.connect_to(host, port, tls).await?;
+        self.conn.connect_to(host, port, use_tls(req.uri())).await?;
         #[cfg(not(feature = "rustls"))]
         self.conn.connect_to(host, port).await?;
 
-        let mut resp = self.send_request(&req).await?;
-
-        // Attempt Digest Authentication if we have credentials and the server requires it
-        if self.credentials.is_some() {
-            if let Ok(mut auth) = digest_access::DigestAccess::try_from(&resp.headers) {
-                let (username, password) = self.credentials.as_ref().unwrap();
-                info!("Resending with Digest Authentication...");
-                auth.set_username(username);
-                auth.set_password(password);
-
-                let body = self.body().await?;
-                let authorization = auth
-                    .generate_authorization("GET", path, body.as_deref(), None)
-                    .unwrap();
-
-                let val = HeaderValue::from_bytes(authorization.as_bytes())?;
-                // Repeat the original request with the AUTHORIZATION header
-                req.headers_mut().insert(header::AUTHORIZATION, val);
-                #[cfg(feature = "rustls")]
-                self.conn.connect_to(host, port, tls).await?;
-                #[cfg(not(feature = "rustls"))]
-                self.conn.connect_to(host, port).await?;
-                resp = self.send_request(&req).await?;
-            }
-        }
-
-        Ok(resp)
-    }
-
-    /// Read the response body, if there is a content-length
-    pub async fn body(&mut self) -> Result<Option<BytesMut>> {
-        match self.content_length {
-            Some(0) | None => Ok(None),
-            Some(l) => {
-                self.read_while(|s| s.rx_buf.len() < l).await?;
-                self.content_length = None;
-                if self.conn.must_close {
-                    self.conn.disconnect();
-                }
-                Ok(Some(self.rx_buf.split_to(l)))
-            }
-        }
+        self.send_request(req).await
     }
 
     /// Read some bytes from the server
@@ -176,35 +149,6 @@ impl Client {
     async fn read(&mut self) -> Result<()> {
         self.rx_buf.read_from(&mut self.conn).await
     }
-
-    async fn handle_headers(&mut self, response: &ResponseHeaders) -> Result<()> {
-        self.content_length = match response.headers.get(header::CONTENT_LENGTH) {
-            Some(l) => {
-                let len = l.to_str()?.parse()?;
-                debug!("Have content-length {len}");
-                Some(len)
-            }
-            None => None,
-        };
-
-        if !self.keep_alive || !response.keep_alive() {
-            self.conn.must_close = true;
-        }
-
-        if self.conn.must_close && self.content_length.is_some_and(|l| l == 0) {
-            self.conn.disconnect();
-        }
-
-        if response.status.is_redirection() {
-            let mut redirects = self.max_redirects;
-            while redirects > 0 {
-                redirects -= 1;
-                // New url
-                // TODO: Read URL and create new request
-            }
-        }
-        Ok(())
-    }
 }
 
 impl Default for Client {
@@ -213,40 +157,148 @@ impl Default for Client {
     }
 }
 
-#[cfg(not(feature = "rustls"))]
-#[inline]
-fn port_from(url: &Uri) -> u16 {
-    url.port_u16().unwrap_or(80)
+impl std::fmt::Debug for Client {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Client")
+            .field("conn", &self.conn)
+            .field("credentials", &self.credentials)
+            .field("max_redirects", &self.max_redirects)
+            .field("keep_alive", &self.keep_alive)
+            .field("allow_basic_auth", &self.allow_basic_auth)
+            .finish()
+    }
 }
 
-#[cfg(feature = "rustls")]
-#[inline]
-fn port_from(url: &Uri) -> u16 {
-    url.port_u16().unwrap_or_else(|| {
-        if url.scheme_str() == Some("https") {
-            443
-        } else {
-            80
-        }
-    })
-}
-
-pub struct ClientConversionError {
+#[derive(Debug)]
+pub struct Response {
+    headers: ResponseHeaders,
     client: Client,
+    content_length: Option<usize>,
+}
+
+impl Response {
+    pub fn from_response_headers(headers: ResponseHeaders, client: Client) -> Self {
+        let content_length = headers.content_length();
+        let must_close = !client.keep_alive || !headers.keep_alive();
+        let mut client = client;
+        client.conn.must_close = must_close;
+        Self {
+            headers,
+            client,
+            content_length,
+        }
+    }
+
+    pub fn into_inner(self) -> Client {
+        self.client
+    }
+
+    pub fn status(&self) -> StatusCode {
+        self.headers.status
+    }
+
+    pub fn version(&self) -> Version {
+        self.headers.version
+    }
+
+    pub fn headers(&self) -> &HeaderMap {
+        &self.headers.headers
+    }
+
+    pub fn must_authenticate(&self) -> bool {
+        self.headers().get(header::WWW_AUTHENTICATE).is_some()
+    }
+
+    pub fn can_authenticate(&self) -> bool {
+        self.client.credentials.is_some()
+    }
+
+    pub async fn authenticate_request<T: Body>(mut self, mut req: Request<T>) -> Result<Self> {
+        if let Some(creds) = self.client.credentials.as_ref() {
+            let authorization =
+                if let Ok(mut auth) = digest_access::DigestAccess::try_from(self.headers()) {
+                    let path = path_query(req.uri());
+                    auth.set_username(creds.username.as_str());
+                    auth.set_password(creds.password.as_str());
+
+                    let body = self.body().await?;
+                    // Unwrap `generate_authorization` only fails if set_username and set_password are not called
+                    auth.generate_authorization("GET", path, body.as_deref(), None)
+                        .unwrap()
+                } else if self.client.allow_basic_auth && self.require_basic_auth() {
+                    use base64::prelude::*;
+                    let auth = format!("{}:{}", creds.username, creds.password);
+                    BASE64_STANDARD.encode(auth)
+                } else {
+                    // Unable to authenticate return self??
+                    return Ok(self);
+                };
+
+            let val = HeaderValue::from_bytes(authorization.as_bytes())?;
+            // Repeat the original request with the AUTHORIZATION header
+            req.headers_mut().insert(header::AUTHORIZATION, val);
+            let host = req.uri().host().ok_or(Error::NoHost)?;
+            let port = port_from(req.uri());
+
+            info!("Resending with Digest Authentication...");
+            #[cfg(feature = "rustls")]
+            self.client
+                .conn
+                .connect_to(host, port, use_tls(req.uri()))
+                .await?;
+            #[cfg(not(feature = "rustls"))]
+            self.client.conn.connect_to(host, port).await?;
+            self.client.send_request(req).await
+        } else {
+            Err(Error::NoCredentials(self))
+        }
+    }
+
+    /// Read the response body, if there is a content-length
+    pub async fn body(&mut self) -> Result<Option<BytesMut>> {
+        match self.content_length {
+            Some(0) | None => Ok(None),
+            Some(l) => {
+                self.client.read_while(|s| s.rx_buf.len() < l).await?;
+                self.content_length = None;
+                if self.client.conn.must_close {
+                    self.client.conn.disconnect();
+                }
+                Ok(Some(self.client.rx_buf.split_to(l)))
+            }
+        }
+    }
+
+    pub fn require_basic_auth(&self) -> bool {
+        // Test if basic authentication is required
+        const BASIC: &[u8] = b"basic";
+        let auth_headers = self.headers().get_all(header::WWW_AUTHENTICATE);
+        for a in auth_headers.iter() {
+            if a.len() > BASIC.len() && a.as_bytes()[..BASIC.len() - 1].eq_ignore_ascii_case(BASIC)
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+pub struct ResponseConversionError {
+    response: Response,
     error: Error,
 }
 
-impl ClientConversionError {
-    fn new(client: Client, error: Error) -> Self {
-        Self { client, error }
+impl ResponseConversionError {
+    fn new(response: Response, error: Error) -> Self {
+        Self { response, error }
     }
 
-    fn with_message(client: Client, message: &'static str) -> Self {
-        Self::new(client, Error::Conversion(message))
+    fn with_message(response: Response, message: &'static str) -> Self {
+        Self::new(response, Error::Conversion(message))
     }
 
-    pub fn into_parts(self) -> (Client, Error) {
-        (self.client, self.error)
+    pub fn into_parts(self) -> (Response, Error) {
+        (self.response, self.error)
     }
 }
 
@@ -258,13 +310,10 @@ pub struct MultipartReplaceClient {
 }
 
 impl MultipartReplaceClient {
-    /// Create a multipart client from a connected client and the server's response
-    /// On failure, the client is returned in `ClientConversionError` for re-use
-    pub fn from_client_response(
-        client: Client,
-        response: ResponseHeaders,
-    ) -> std::result::Result<Self, ClientConversionError> {
-        if let Some(content) = response.headers.get(header::CONTENT_TYPE) {
+    /// Create a multipart client from a connected client server's response
+    /// On failure, the client is returned in `ResponseConversionError` for re-use
+    pub fn from_response(response: Response) -> std::result::Result<Self, ResponseConversionError> {
+        if let Some(content) = response.headers().get(header::CONTENT_TYPE) {
             if let Some(boundary) = multipart_replace(content.as_bytes()) {
                 let content_type = Bytes::copy_from_slice(content.as_bytes());
                 debug!(
@@ -273,15 +322,15 @@ impl MultipartReplaceClient {
                     String::from_utf8_lossy(&boundary)
                 );
                 let c = Self {
-                    inner: client,
+                    inner: response.client,
                     content_type,
                     boundary,
                 };
                 return Ok(c);
             }
         }
-        Err(ClientConversionError::with_message(
-            client,
+        Err(ResponseConversionError::with_message(
+            response,
             "Invalid headers",
         ))
     }
@@ -448,6 +497,48 @@ fn read_length_header(chunk: &[u8]) -> Option<(usize, usize)> {
         }
     }
     None
+}
+
+#[cfg(not(feature = "rustls"))]
+#[inline]
+fn port_from(url: &Uri) -> u16 {
+    url.port_u16().unwrap_or(80)
+}
+
+#[cfg(feature = "rustls")]
+#[inline]
+fn port_from(url: &Uri) -> u16 {
+    url.port_u16().unwrap_or_else(|| {
+        if url.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        }
+    })
+}
+
+#[cfg(feature = "rustls")]
+#[inline]
+fn use_tls(url: &Uri) -> bool {
+    url.scheme_str() == Some("https")
+}
+
+/// Strip any credentials from a url, returning to the caller any extracted credentials
+fn strip_credentials(url: Uri) -> (Uri, Option<Credentials>) {
+    let mut credentials = None;
+    let mut parts = url.into_parts();
+    if let Some(aut) = parts.authority.as_ref() {
+        if let Some((creds, rest)) = aut.as_str().split_once('@') {
+            if let Some((username, password)) = creds.split_once(':') {
+                credentials = Some(Credentials::new(username, password));
+            }
+            parts.authority = Some(rest.parse().expect("Had invalid url"));
+        }
+    }
+    (
+        Uri::from_parts(parts).expect("Had invalid url"),
+        credentials,
+    )
 }
 
 #[cfg(test)]

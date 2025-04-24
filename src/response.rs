@@ -5,6 +5,7 @@ use super::{Error, Result};
 
 /// A structure for the response headers, without any support for a body
 /// Simplified from `http`
+#[derive(Debug)]
 pub struct ResponseHeaders {
     /// The response's status
     pub status: StatusCode,
@@ -16,14 +17,37 @@ pub struct ResponseHeaders {
     pub headers: HeaderMap<HeaderValue>,
 }
 
+impl ResponseHeaders {
+    pub fn keep_alive(&self) -> bool {
+        if self.version == Version::HTTP_11 {
+            if let Some(v) = self.headers.get(header::CONNECTION) {
+                if !v.as_bytes().eq_ignore_ascii_case(b"close") {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    pub fn content_length(&self) -> Option<usize> {
+        match self.headers.get(header::CONTENT_LENGTH) {
+            Some(l) => {
+                let len = l.to_str().ok()?.parse().ok()?;
+                Some(len)
+            }
+            None => None,
+        }
+    }
+}
+
 /// The context and result store for `httparser`
-pub struct ResponseCtx<const CAP: usize> {
+pub(crate) struct ResponseCtx<const CAP: usize> {
     prev_len: usize,
     parse_size: usize,
 }
 
 impl<const CAP: usize> ResponseCtx<CAP> {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             prev_len: 0,
             parse_size: 0,
@@ -31,7 +55,7 @@ impl<const CAP: usize> ResponseCtx<CAP> {
     }
 
     /// Extract response headers from a buffer
-    pub fn parse(&mut self, buf: &[u8]) -> Result<Option<ResponseHeaders>> {
+    pub(crate) fn parse(&mut self, buf: &[u8]) -> Result<Option<ResponseHeaders>> {
         let prev_len = self.prev_len;
         self.prev_len = buf.len();
         if prev_len > 0 && !is_complete_fast(buf, prev_len) {
@@ -53,21 +77,8 @@ impl<const CAP: usize> ResponseCtx<CAP> {
         }
     }
 
-    pub fn size(&self) -> usize {
+    pub(crate) fn size(&self) -> usize {
         self.parse_size
-    }
-}
-
-impl ResponseHeaders {
-    pub fn keep_alive(&self) -> bool {
-        if self.version == Version::HTTP_11 {
-            if let Some(v) = self.headers.get(header::CONNECTION) {
-                if !v.as_bytes().eq_ignore_ascii_case(b"close") {
-                    return true;
-                }
-            }
-        }
-        false
     }
 }
 

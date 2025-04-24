@@ -16,21 +16,21 @@ async fn main() -> unhttp::Result<()> {
     };
 
     let url = url.parse::<Uri>().unwrap();
-    if url.scheme_str() != Some("http") {
-        println!("Unhttp only works with 'http' URLs.");
+    if url.scheme_str() != Some("http") && url.scheme_str() != Some("https") {
+        println!("Unhttp only works with 'http' or 'https' URLs.");
         return Ok(());
     }
 
     println!("Attempting to GET: {url}");
     let mut client = Client::new();
-    let response = client.get(url).await?;
+    let mut response = client.get(url).await?;
 
-    println!("Response is {}", response.status);
+    println!("Response is {}", response.status());
 
-    if let Some(body) = client.body().await? {
+    if let Some(body) = response.body().await? {
         println!("Have body:{}", String::from_utf8_lossy(&body));
     } else {
-        match MultipartReplaceClient::from_client_response(client, response) {
+        match MultipartReplaceClient::from_response(response) {
             Ok(mut m) => loop {
                 let buf = m.next_part_sized().await?;
                 println!("Chunk: `{}`", String::from_utf8_lossy(&buf));
@@ -38,7 +38,7 @@ async fn main() -> unhttp::Result<()> {
             Err(e) => {
                 let (c, err) = e.into_parts();
                 error!("Failed conversion {err}");
-                client = c;
+                client = c.into_inner();
                 loop {
                     let buf = client.read_some().await?;
                     println!("Have data: {}", String::from_utf8_lossy(&buf));
