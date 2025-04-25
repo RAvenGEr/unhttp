@@ -9,7 +9,6 @@ use thiserror::Error;
 pub use http;
 
 pub use client::*;
-pub use response::ResponseHeaders;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -19,6 +18,12 @@ pub enum Error {
     NoAddress,
     #[error("No credentials")]
     NoCredentials(Response),
+    #[error("Not authorized")]
+    NotAuthorized(Response),
+    #[error("Too many redirects")]
+    TooManyRedirects(Response),
+    #[error("Invalid response")]
+    InvalidResponse(Response),
     #[error("No status in response")]
     MissingStatus,
     #[error("Not connected")]
@@ -45,7 +50,7 @@ pub enum Error {
     ParseInt(#[from] std::num::ParseIntError),
     #[cfg(feature = "rustls")]
     #[error("Invalid DNS name")]
-    InvalidDNSName(#[from] rustls::pki_types::InvalidDnsNameError),
+    InvalidDnsName(#[from] rustls::pki_types::InvalidDnsNameError),
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

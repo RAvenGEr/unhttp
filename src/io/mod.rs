@@ -53,6 +53,11 @@ impl ReadBuffer {
     }
 
     #[inline]
+    pub(crate) fn clear(&mut self) {
+        self.buf.clear();
+    }
+
+    #[inline]
     pub(crate) fn split(&mut self) -> BytesMut {
         self.buf.split()
     }

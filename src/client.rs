@@ -2,7 +2,7 @@ use bytes::{Buf, Bytes, BytesMut};
 use http::{HeaderMap, HeaderValue, Request, StatusCode, Version, header};
 use http_body::Body;
 use http_body_util::Empty;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use memchr::{memchr, memmem};
 
 use super::*;
@@ -16,6 +16,7 @@ pub struct Client {
     max_redirects: u32,
     keep_alive: bool,
     allow_basic_auth: bool,
+    state: InternalState,
 }
 
 impl Client {
@@ -27,38 +28,39 @@ impl Client {
             max_redirects: 1,
             keep_alive: true,
             allow_basic_auth: false,
+            state: InternalState::default(),
         }
     }
 
-    /// Set credentials for Digest Authentication
-    /// TODO: Consider supporting Basic Authentication
+    /// Set credentials for authentication
     pub fn credentials<S: Into<String>, T: Into<String>>(
-        &mut self,
+        mut self,
         username: S,
         password: T,
-    ) -> &mut Self {
+    ) -> Self {
         self.credentials = Some(Credentials::new(username.into(), password.into()));
         self
     }
 
     /// Set the minimum bytes available for read operations
-    pub fn read_buffer_reservation(&mut self, size: usize) -> &mut Self {
+    pub fn read_buffer_reservation(mut self, size: usize) -> Self {
         self.rx_buf.set_min_read(size);
         self
     }
 
-    pub fn keep_alive(&mut self, keep_alive: bool) -> &mut Self {
+    pub fn keep_alive(mut self, keep_alive: bool) -> Self {
         self.keep_alive = keep_alive;
         self
     }
 
-    pub fn allow_basic_auth(&mut self, allow_basic: bool) -> &mut Self {
+    pub fn allow_basic_auth(mut self, allow_basic: bool) -> Self {
         self.allow_basic_auth = allow_basic;
         self
     }
 
     /// Send a request to the remote and read any response
     pub async fn send_request<B: http_body::Body>(mut self, req: Request<B>) -> Result<Response> {
+        self.rx_buf.clear();
         request::write_request(&mut self.conn, &req).await?;
         // Read Response
         let mut ctx: response::ResponseCtx<64> = response::ResponseCtx::new();
@@ -71,11 +73,13 @@ impl Client {
                 break Response::from_response_headers(res, self);
             }
         };
-        // Attempt authentication if we have credentials and the server requires it
-        if resp.must_authenticate() && resp.can_authenticate() {
+        if resp.must_authenticate() {
+            // Attempt authentication
             Box::pin(resp.authenticate_request(req)).await
+        } else if resp.is_redirection() {
+            // Follow redirection
+            Box::pin(resp.follow_redirect(req)).await
         } else {
-            // TODO: Handle redirect
             Ok(resp)
         }
     }
@@ -171,19 +175,23 @@ impl std::fmt::Debug for Client {
 
 #[derive(Debug)]
 pub struct Response {
-    headers: ResponseHeaders,
+    status: StatusCode,
+    version: Version,
+    headers: HeaderMap<HeaderValue>,
     client: Client,
     content_length: Option<usize>,
 }
 
 impl Response {
-    pub fn from_response_headers(headers: ResponseHeaders, client: Client) -> Self {
+    pub fn from_response_headers(headers: response::ResponseHeaders, client: Client) -> Self {
         let content_length = headers.content_length();
         let must_close = !client.keep_alive || !headers.keep_alive();
         let mut client = client;
         client.conn.must_close = must_close;
         Self {
-            headers,
+            status: headers.status,
+            version: headers.version,
+            headers: headers.headers,
             client,
             content_length,
         }
@@ -194,27 +202,35 @@ impl Response {
     }
 
     pub fn status(&self) -> StatusCode {
-        self.headers.status
+        self.status
     }
 
     pub fn version(&self) -> Version {
-        self.headers.version
+        self.version
     }
 
     pub fn headers(&self) -> &HeaderMap {
-        &self.headers.headers
-    }
-
-    pub fn must_authenticate(&self) -> bool {
-        self.headers().get(header::WWW_AUTHENTICATE).is_some()
+        &self.headers
     }
 
     pub fn can_authenticate(&self) -> bool {
         self.client.credentials.is_some()
     }
 
+    pub fn must_authenticate(&self) -> bool {
+        self.headers.get(header::WWW_AUTHENTICATE).is_some()
+    }
+
+    pub fn is_redirection(&self) -> bool {
+        self.status.is_redirection()
+    }
+
     pub async fn authenticate_request<T: Body>(mut self, mut req: Request<T>) -> Result<Self> {
-        if let Some(creds) = self.client.credentials.as_ref() {
+        if self.client.state.is_authenticating() {
+            // Failed auth
+            self.client.state = InternalState::None;
+            Err(Error::NotAuthorized(self))
+        } else if let Some(creds) = self.client.credentials.as_ref() {
             let authorization =
                 if let Ok(mut auth) = digest_access::DigestAccess::try_from(self.headers()) {
                     let path = path_query(req.uri());
@@ -228,7 +244,7 @@ impl Response {
                 } else if self.client.allow_basic_auth && self.require_basic_auth() {
                     use base64::prelude::*;
                     let auth = format!("{}:{}", creds.username, creds.password);
-                    BASE64_STANDARD.encode(auth)
+                    format!("Basic {}", BASE64_STANDARD.encode(auth))
                 } else {
                     // Unable to authenticate return self??
                     return Ok(self);
@@ -239,8 +255,8 @@ impl Response {
             req.headers_mut().insert(header::AUTHORIZATION, val);
             let host = req.uri().host().ok_or(Error::NoHost)?;
             let port = port_from(req.uri());
-
-            info!("Resending with Digest Authentication...");
+            self.client.state = InternalState::Authenticating;
+            info!("Resending with authentication...");
             #[cfg(feature = "rustls")]
             self.client
                 .conn
@@ -254,7 +270,43 @@ impl Response {
         }
     }
 
-    /// Read the response body, if there is a content-length
+    pub async fn follow_redirect<T: Body>(mut self, mut req: Request<T>) -> Result<Self> {
+        let redirects = if let InternalState::Redirect(c) = self.client.state {
+            c
+        } else {
+            0
+        };
+        self.client.state = InternalState::None;
+        if redirects >= self.client.max_redirects {
+            Err(Error::TooManyRedirects(self))
+        } else if let Some(url) = self.headers.get(header::LOCATION) {
+            match Uri::try_from(url.as_bytes()) {
+                Ok(u) => {
+                    info!("Following redirect to {u} ...");
+                    *req.uri_mut() = u;
+                    let host = req.uri().host().ok_or(Error::NoHost)?;
+                    let port = port_from(req.uri());
+                    self.client.state = InternalState::Redirect(redirects + 1);
+                    #[cfg(feature = "rustls")]
+                    self.client
+                        .conn
+                        .connect_to(host, port, use_tls(req.uri()))
+                        .await?;
+                    #[cfg(not(feature = "rustls"))]
+                    self.client.conn.connect_to(host, port).await?;
+                    self.client.send_request(req).await
+                }
+                Err(e) => {
+                    error!("Redirect location: {e}");
+                    Err(Error::InvalidResponse(self))
+                }
+            }
+        } else {
+            Err(Error::InvalidResponse(self))
+        }
+    }
+
+    /// Read the response body, if there is a non-zero content-length
     pub async fn body(&mut self) -> Result<Option<BytesMut>> {
         match self.content_length {
             Some(0) | None => Ok(None),
@@ -272,11 +324,11 @@ impl Response {
     pub fn require_basic_auth(&self) -> bool {
         // Test if basic authentication is required
         const BASIC: &[u8] = b"basic";
-        let auth_headers = self.headers().get_all(header::WWW_AUTHENTICATE);
+        let auth_headers = self.headers.get_all(header::WWW_AUTHENTICATE);
         for a in auth_headers.iter() {
-            if a.len() > BASIC.len() && a.as_bytes()[..BASIC.len() - 1].eq_ignore_ascii_case(BASIC)
-            {
-                return true;
+            if a.len() > BASIC.len() {
+                let cmp = &a.as_bytes()[..BASIC.len()];
+                return cmp.eq_ignore_ascii_case(BASIC);
             }
         }
         false
@@ -499,6 +551,20 @@ fn read_length_header(chunk: &[u8]) -> Option<(usize, usize)> {
     None
 }
 
+#[derive(Default)]
+enum InternalState {
+    #[default]
+    None,
+    Redirect(u32),
+    Authenticating,
+}
+
+impl InternalState {
+    fn is_authenticating(&self) -> bool {
+        matches!(self, Self::Authenticating)
+    }
+}
+
 #[cfg(not(feature = "rustls"))]
 #[inline]
 fn port_from(url: &Uri) -> u16 {
@@ -568,5 +634,77 @@ mod test {
         assert_eq!(EXPECTED, ext);
         let content = ext.content(&FIRST_PACKET);
         assert_eq!(Some(FIRST_CONTENT), content);
+    }
+
+    #[test]
+    #[ignore]
+    fn online_digest_authentication() {
+        // Send a request to httpbin.org to a url that requires Digest Access Authentication
+        let user = "FredJones";
+        let password = "P@55w0rd!";
+        let p_q = format!("/digest-auth/auth/{user}/{password}");
+        let test_url = Uri::builder()
+            .scheme("http")
+            .authority("httpbin.org")
+            .path_and_query(p_q)
+            .build()
+            .expect("URL must build");
+
+        let rt = tokio::runtime::Runtime::new().expect("Failure creating async runtime");
+        rt.block_on(async move {
+            let resp = Client::default()
+                .credentials(user, password)
+                .get(test_url)
+                .await;
+            match resp {
+                Ok(mut response) => {
+                    let body = response.body().await.expect("No result");
+                    assert_eq!(
+                        body,
+                        Some(BytesMut::from(
+                            &b"{\n  \"authenticated\": true, \n  \"user\": \"FredJones\"\n}\n"[..]
+                        ))
+                    );
+                }
+                Err(e) => panic!("Response error: {e}"),
+            }
+        });
+    }
+
+    #[test]
+    #[ignore]
+    fn online_basic_authentication() {
+        // Send a request to httpbin.org to a url that requires Basic Authentication
+        let user = "FredJones";
+        let password = "P@55w0rd!";
+        let p_q = format!("/basic-auth/{user}/{password}");
+        let test_url = Uri::builder()
+            .scheme("http")
+            .authority("httpbin.org")
+            .path_and_query(p_q)
+            .build()
+            .expect("URL must build");
+
+        let rt = tokio::runtime::Runtime::new().expect("Failure creating async runtime");
+        rt.block_on(async move {
+            let resp = Client::default()
+                .credentials(user, password)
+                .allow_basic_auth(true)
+                .get(test_url)
+                .await;
+            match resp {
+                Ok(mut response) => {
+                    assert_eq!(response.status(), StatusCode::OK);
+                    let body = response.body().await.expect("No result");
+                    assert_eq!(
+                        body,
+                        Some(BytesMut::from(
+                            &b"{\n  \"authenticated\": true, \n  \"user\": \"FredJones\"\n}\n"[..]
+                        ))
+                    );
+                }
+                Err(e) => panic!("Response error: {e}"),
+            }
+        });
     }
 }

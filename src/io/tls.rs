@@ -1,5 +1,6 @@
 use std::{sync::Arc, task::Poll};
 
+use log::debug;
 use rustls::{ClientConfig, pki_types::ServerName};
 use rustls_platform_verifier::ConfigVerifierExt;
 use tokio::{
@@ -47,6 +48,7 @@ impl Connection {
         self.disconnect();
         let addr = self.addr.as_ref().ok_or(Error::NoAddress)?;
         if self.tls {
+            debug!("Connecting TLS to {}:{}", addr.0, addr.1);
             let config = ClientConfig::with_platform_verifier();
             let connector = TlsConnector::from(Arc::new(config));
             let name = addr.0.clone();
@@ -55,6 +57,7 @@ impl Connection {
             let stream = connector.connect(dnsname, stream).await?;
             self.stream = AnyStream::Tls(stream);
         } else {
+            debug!("Connecting TCP to {}:{}", addr.0, addr.1);
             self.stream = AnyStream::Tcp(TcpStream::connect(addr).await?);
         }
         Ok(())
