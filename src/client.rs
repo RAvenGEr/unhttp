@@ -42,6 +42,11 @@ impl Client {
         self
     }
 
+    pub fn set_credentials(mut self, credentials: Option<Credentials>) -> Self {
+        self.credentials = credentials.clone();
+        self
+    }
+
     /// Set the minimum bytes available for read operations
     pub fn read_buffer_reservation(mut self, size: usize) -> Self {
         self.rx_buf.set_min_read(size);

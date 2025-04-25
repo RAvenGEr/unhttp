@@ -55,6 +55,7 @@ pub enum Error {
 
 pub type Result<T> = std::result::Result<T, Error>;
 
+#[derive(Clone)]
 pub struct Credentials {
     username: String,
     password: String,
@@ -87,6 +88,24 @@ impl Credentials {
         } else {
             None
         }
+    }
+
+    pub fn username(&self) -> &str {
+        self.username.as_str()
+    }
+
+    pub fn password(&self) -> &str {
+        self.password.as_str()
+    }
+
+    pub fn set_username<S: Into<String>>(&mut self, username: S) -> &mut Self {
+        self.username = username.into();
+        self
+    }
+
+    pub fn set_password<S: Into<String>>(&mut self, password: S) -> &mut Self {
+        self.password = password.into();
+        self
     }
 }
 
