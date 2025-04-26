@@ -11,6 +11,7 @@ keywords = ["http", "async", "client"]
 readme = "README.md"
 
 [dependencies]
+base64 = "0.22"
 bytes = "1"
 digest-access = { version = "0.3", features = ["http"] }
 http = "1"
@@ -19,9 +20,19 @@ http-body-util = "0.1"
 httparse = "1"
 log = "0.4"
 memchr = "2"
+rustls = { version = "0.23", optional = true }
+rustls-platform-verifier = { version = "0.5", optional = true }
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "net"] }
+tokio = { version = "1", features = ["io-util", "net", "time"] }
+tokio-rustls = { version = "0.26", optional = true }
+
+[features]
+default = []
+rustls = ["dep:rustls", "tokio-rustls", "rustls-platform-verifier"]
 
 [dev-dependencies]
 pretty_env_logger = "0.5"
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[[example]]
+name = "simple_get"
