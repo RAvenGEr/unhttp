@@ -1,6 +1,6 @@
 [package]
 name = "unhttp"
-version = "0.1.0"
+version = "0.2.0"
 authors = ["David Webb <ravenger@dpwlabs.com>"]
 description = "An async HTTP library that allows non-standard (ab)uses of the protocol."
 repository = "https://github.com/RAvenGEr/digest-access"
