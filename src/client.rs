@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use bytes::{Buf, Bytes, BytesMut};
 use http::{HeaderMap, HeaderValue, Request, StatusCode, Version, header};
 use http_body::Body;
@@ -17,6 +19,8 @@ pub struct Client {
     keep_alive: bool,
     allow_basic_auth: bool,
     state: InternalState,
+    read_timeout: Option<Duration>,
+    write_timeout: Option<Duration>,
 }
 
 impl Client {
@@ -29,6 +33,8 @@ impl Client {
             keep_alive: true,
             allow_basic_auth: false,
             state: InternalState::default(),
+            read_timeout: None,
+            write_timeout: None,
         }
     }
 
@@ -63,10 +69,25 @@ impl Client {
         self
     }
 
+    pub fn connect_timeout(mut self, timeout: Duration) -> Self {
+        self.conn.connect_timeout = Some(timeout);
+        self
+    }
+
+    pub fn read_timeout(mut self, timeout: Duration) -> Self {
+        self.read_timeout = Some(timeout);
+        self
+    }
+
+    pub fn write_timeout(mut self, timeout: Duration) -> Self {
+        self.write_timeout = Some(timeout);
+        self
+    }
+
     /// Send a request to the remote and read any response
     pub async fn send_request<B: http_body::Body>(mut self, req: Request<B>) -> Result<Response> {
         self.rx_buf.clear();
-        request::write_request(&mut self.conn, &req).await?;
+        self.write_request(&req).await?;
         // Read Response
         let mut ctx: response::ResponseCtx<64> = response::ResponseCtx::new();
         let resp = loop {
@@ -156,7 +177,22 @@ impl Client {
 
     #[inline]
     async fn read(&mut self) -> Result<()> {
-        self.rx_buf.read_from(&mut self.conn).await
+        use tokio::time::timeout;
+        let f = self.rx_buf.read_from(&mut self.conn);
+        match self.read_timeout {
+            Some(time) => timeout(time, f).await?,
+            None => f.await,
+        }
+    }
+
+    #[inline]
+    async fn write_request<B: Body>(&mut self, req: &Request<B>) -> Result<()> {
+        use tokio::time::timeout;
+        let f = request::write_request(&mut self.conn, req);
+        match self.write_timeout {
+            Some(time) => timeout(time, f).await?,
+            None => f.await,
+        }
     }
 }
 
@@ -610,6 +646,12 @@ fn strip_credentials(url: Uri) -> (Uri, Option<Credentials>) {
         Uri::from_parts(parts).expect("Had invalid url"),
         credentials,
     )
+}
+
+impl From<tokio::time::error::Elapsed> for Error {
+    fn from(_value: tokio::time::error::Elapsed) -> Self {
+        Self::TokioTimeout
+    }
 }
 
 #[cfg(test)]

@@ -1,4 +1,4 @@
-use std::task::Poll;
+use std::{task::Poll, time::Duration};
 
 use tokio::{io::AsyncWrite, net::TcpStream};
 
@@ -10,6 +10,7 @@ pub struct Connection {
     stream: Option<TcpStream>,
     addr: Option<(String, u16)>,
     pub(crate) must_close: bool,
+    pub(crate) connect_timeout: Option<Duration>,
 }
 
 impl Connection {
@@ -21,9 +22,15 @@ impl Connection {
     }
 
     pub async fn connect(&mut self) -> Result<()> {
+        use tokio::time::timeout;
         self.disconnect();
         let addr = self.addr.as_ref().ok_or(Error::NoAddress)?;
-        self.stream = Some(TcpStream::connect(addr).await?);
+        let f = TcpStream::connect(addr);
+        let stream = match self.connect_timeout {
+            Some(time) => timeout(time, f).await?,
+            None => f.await,
+        };
+        self.stream = Some(stream?);
         Ok(())
     }
 

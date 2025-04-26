@@ -1,4 +1,4 @@
-use std::{sync::Arc, task::Poll};
+use std::{sync::Arc, task::Poll, time::Duration};
 
 use log::debug;
 use rustls::{ClientConfig, pki_types::ServerName};
@@ -32,6 +32,7 @@ pub struct Connection {
     addr: Option<(String, u16)>,
     tls: bool,
     pub(crate) must_close: bool,
+    pub(crate) connect_timeout: Option<Duration>,
 }
 
 impl Connection {
@@ -45,20 +46,28 @@ impl Connection {
     }
 
     pub async fn connect(&mut self) -> Result<()> {
+        use tokio::time::timeout;
         self.disconnect();
         let addr = self.addr.as_ref().ok_or(Error::NoAddress)?;
+        let f = TcpStream::connect(addr);
+        let stream = match self.connect_timeout {
+            Some(time) => timeout(time, f).await?,
+            None => f.await,
+        }?;
         if self.tls {
             debug!("Connecting TLS to {}:{}", addr.0, addr.1);
             let config = ClientConfig::with_platform_verifier();
             let connector = TlsConnector::from(Arc::new(config));
             let name = addr.0.clone();
             let dnsname = ServerName::try_from(name)?;
-            let stream = TcpStream::connect(&addr).await?;
-            let stream = connector.connect(dnsname, stream).await?;
+            let f = connector.connect(dnsname, stream);
+            let stream = match self.connect_timeout {
+                Some(time) => timeout(time, f).await?,
+                None => f.await,
+            }?;
             self.stream = AnyStream::Tls(stream);
         } else {
-            debug!("Connecting TCP to {}:{}", addr.0, addr.1);
-            self.stream = AnyStream::Tcp(TcpStream::connect(addr).await?);
+            self.stream = AnyStream::Tcp(stream);
         }
         Ok(())
     }

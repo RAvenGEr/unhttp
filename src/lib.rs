@@ -36,6 +36,8 @@ pub enum Error {
     Httparse(#[from] httparse::Error),
     #[error("io error")]
     TokioIo(#[from] tokio::io::Error),
+    #[error("timeout")]
+    TokioTimeout,
     #[error("Invalid header name")]
     InvalidHeaderName(#[from] http::header::InvalidHeaderName),
     #[error("Invalid header value")]
